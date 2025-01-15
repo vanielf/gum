@@ -3,34 +3,59 @@ package choose
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 
-	"github.com/alecthomas/kong"
+	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/paginator"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
-
-	"github.com/charmbracelet/gum/internal/exit"
 	"github.com/charmbracelet/gum/internal/stdin"
-	"github.com/charmbracelet/gum/style"
-)
-
-var (
-	subduedStyle     = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#847A85", Dark: "#979797"})
-	verySubduedStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#DDDADA", Dark: "#3C3C3C"})
+	"github.com/charmbracelet/gum/internal/timeout"
+	"github.com/charmbracelet/gum/internal/tty"
+	"github.com/charmbracelet/lipgloss"
 )
 
 // Run provides a shell script interface for choosing between different through
 // options.
 func (o Options) Run() error {
-	if len(o.Options) == 0 {
-		input, _ := stdin.Read()
+	var (
+		subduedStyle     = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#847A85", Dark: "#979797"})
+		verySubduedStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#DDDADA", Dark: "#3C3C3C"})
+	)
+
+	input, _ := stdin.Read(stdin.StripANSI(o.StripANSI))
+	if len(o.Options) > 0 && len(o.Selected) == 0 {
+		o.Selected = strings.Split(input, o.InputDelimiter)
+	} else if len(o.Options) == 0 {
 		if input == "" {
 			return errors.New("no options provided, see `gum choose --help`")
 		}
-		o.Options = strings.Split(strings.TrimSuffix(input, "\n"), "\n")
+		o.Options = strings.Split(input, o.InputDelimiter)
+	}
+
+	// normalize options into a map
+	options := map[string]string{}
+	for _, opt := range o.Options {
+		if o.LabelDelimiter == "" {
+			options[opt] = opt
+			continue
+		}
+		label, value, ok := strings.Cut(opt, o.LabelDelimiter)
+		if !ok {
+			return fmt.Errorf("invalid option format: %q", opt)
+		}
+		options[label] = value
+	}
+	if o.LabelDelimiter != "" {
+		o.Options = slices.Collect(maps.Keys(options))
+	}
+
+	if o.SelectIfOne && len(o.Options) == 1 {
+		fmt.Println(options[o.Options[0]])
+		return nil
 	}
 
 	// We don't need to display prefixes if we are only picking one option.
@@ -41,30 +66,27 @@ func (o Options) Run() error {
 		o.CursorPrefix = ""
 	}
 
-	// If we've set no limit then we can simply select as many options as there
-	// are so let's set the limit to the number of options.
 	if o.NoLimit {
-		o.Limit = len(o.Options)
+		o.Limit = len(o.Options) + 1
 	}
 
-	if len(o.Selected) > o.Limit {
-		return errors.New("number of selected options cannot be greater than the limit")
+	if o.Ordered {
+		slices.SortFunc(o.Options, strings.Compare)
 	}
+
+	isSelectAll := len(o.Selected) == 1 && o.Selected[0] == "*"
 
 	// Keep track of the selected items.
 	currentSelected := 0
 	// Check if selected items should be used.
 	hasSelectedItems := len(o.Selected) > 0
-
 	startingIndex := 0
 	currentOrder := 0
-
 	items := make([]item, len(o.Options))
-
 	for i, option := range o.Options {
 		var order int
 		// Check if the option should be selected.
-		isSelected := hasSelectedItems && currentSelected < o.Limit && arrayContains(o.Selected, option)
+		isSelected := hasSelectedItems && currentSelected < o.Limit && (isSelectAll || slices.Contains(o.Selected, option))
 		// If the option is selected then increment the current selected count.
 		if isSelected {
 			if o.Limit == 1 {
@@ -78,7 +100,6 @@ func (o Options) Run() error {
 				currentOrder++
 			}
 		}
-
 		items[i] = item{text: option, selected: isSelected, order: order}
 	}
 
@@ -90,18 +111,23 @@ func (o Options) Run() error {
 	pager.Type = paginator.Dots
 	pager.ActiveDot = subduedStyle.Render("•")
 	pager.InactiveDot = verySubduedStyle.Render("•")
+	pager.KeyMap = paginator.KeyMap{}
+	pager.Page = startingIndex / o.Height
 
-	// Disable Keybindings since we will control it ourselves.
-	pager.UseHLKeys = false
-	pager.UseLeftRightKeys = false
-	pager.UseJKKeys = false
-	pager.UsePgUpPgDownKeys = false
+	km := defaultKeymap()
+	if o.NoLimit || o.Limit > 1 {
+		km.Toggle.SetEnabled(true)
+	}
+	if o.NoLimit {
+		km.ToggleAll.SetEnabled(true)
+	}
 
-	tm, err := tea.NewProgram(model{
+	m := model{
 		index:             startingIndex,
 		currentOrder:      currentOrder,
 		height:            o.Height,
 		cursor:            o.Cursor,
+		header:            o.Header,
 		selectedPrefix:    o.SelectedPrefix,
 		unselectedPrefix:  o.UnselectedPrefix,
 		cursorPrefix:      o.CursorPrefix,
@@ -109,52 +135,43 @@ func (o Options) Run() error {
 		limit:             o.Limit,
 		paginator:         pager,
 		cursorStyle:       o.CursorStyle.ToLipgloss(),
+		headerStyle:       o.HeaderStyle.ToLipgloss(),
 		itemStyle:         o.ItemStyle.ToLipgloss(),
 		selectedItemStyle: o.SelectedItemStyle.ToLipgloss(),
 		numSelected:       currentSelected,
-	}, tea.WithOutput(os.Stderr)).Run()
+		showHelp:          o.ShowHelp,
+		help:              help.New(),
+		keymap:            km,
+	}
 
+	ctx, cancel := timeout.Context(o.Timeout)
+	defer cancel()
+
+	// Disable Keybindings since we will control it ourselves.
+	tm, err := tea.NewProgram(
+		m,
+		tea.WithOutput(os.Stderr),
+		tea.WithContext(ctx),
+	).Run()
 	if err != nil {
-		return fmt.Errorf("failed to start tea program: %w", err)
+		return fmt.Errorf("unable to pick selection: %w", err)
 	}
-
-	m := tm.(model)
-	if m.aborted {
-		return exit.ErrAborted
+	m = tm.(model)
+	if !m.submitted {
+		return errors.New("nothing selected")
 	}
-
 	if o.Ordered && o.Limit > 1 {
 		sort.Slice(m.items, func(i, j int) bool {
 			return m.items[i].order < m.items[j].order
 		})
 	}
 
-	var s strings.Builder
-
+	var out []string
 	for _, item := range m.items {
 		if item.selected {
-			s.WriteString(item.text)
-			s.WriteRune('\n')
+			out = append(out, options[item.text])
 		}
 	}
-
-	fmt.Print(s.String())
-
+	tty.Println(strings.Join(out, o.OutputDelimiter))
 	return nil
-}
-
-// BeforeReset hook. Used to unclutter style flags.
-func (o Options) BeforeReset(ctx *kong.Context) error {
-	style.HideFlags(ctx)
-	return nil
-}
-
-// Check if an array contains a value.
-func arrayContains(strArray []string, value string) bool {
-	for _, str := range strArray {
-		if str == value {
-			return true
-		}
-	}
-	return false
 }

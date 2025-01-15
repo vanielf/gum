@@ -5,31 +5,41 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/alecthomas/kong"
+	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/table"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/mattn/go-runewidth"
-
 	"github.com/charmbracelet/gum/internal/stdin"
+	"github.com/charmbracelet/gum/internal/timeout"
 	"github.com/charmbracelet/gum/style"
+	"github.com/charmbracelet/lipgloss"
+	ltable "github.com/charmbracelet/lipgloss/table"
+	"github.com/charmbracelet/x/term"
+	"golang.org/x/text/encoding"
+	"golang.org/x/text/encoding/unicode"
+	"golang.org/x/text/transform"
 )
 
 // Run provides a shell script interface for rendering tabular data (CSV).
 func (o Options) Run() error {
-	var reader *csv.Reader
+	var input *os.File
 	if o.File != "" {
-		file, err := os.Open(o.File)
+		var err error
+		input, err = os.Open(o.File)
 		if err != nil {
-			return fmt.Errorf("could not find file at path %s", o.File)
+			return fmt.Errorf("could not render file: %w", err)
 		}
-		reader = csv.NewReader(file)
 	} else {
 		if stdin.IsEmpty() {
 			return fmt.Errorf("no data provided")
 		}
-		reader = csv.NewReader(os.Stdin)
+		input = os.Stdin
 	}
+	defer input.Close() //nolint: errcheck
 
+	transformer := unicode.BOMOverride(encoding.Nop.NewDecoder())
+	reader := csv.NewReader(transform.NewReader(input, transformer))
+	reader.LazyQuotes = o.LazyQuotes
+	reader.FieldsPerRecord = o.FieldsPerRecord
 	separatorRunes := []rune(o.Separator)
 	if len(separatorRunes) != 1 {
 		return fmt.Errorf("separator must be single character")
@@ -56,10 +66,10 @@ func (o Options) Run() error {
 	if err != nil {
 		return fmt.Errorf("invalid data provided")
 	}
-	var columns = make([]table.Column, 0, len(columnNames))
+	columns := make([]table.Column, 0, len(columnNames))
 
 	for i, title := range columnNames {
-		width := runewidth.StringWidth(title)
+		width := lipgloss.Width(title)
 		if len(o.Widths) > i {
 			width = o.Widths[i]
 		}
@@ -74,27 +84,75 @@ func (o Options) Run() error {
 	styles := table.Styles{
 		Cell:     defaultStyles.Cell.Inherit(o.CellStyle.ToLipgloss()),
 		Header:   defaultStyles.Header.Inherit(o.HeaderStyle.ToLipgloss()),
-		Selected: defaultStyles.Selected.Inherit(o.SelectedStyle.ToLipgloss()),
+		Selected: o.SelectedStyle.ToLipgloss(),
 	}
 
-	var rows = make([]table.Row, 0, len(data))
-	for _, row := range data {
-		if len(row) > len(columns) {
+	rows := make([]table.Row, 0, len(data))
+	for row := range data {
+		if len(data[row]) > len(columns) {
 			return fmt.Errorf("invalid number of columns")
 		}
-		rows = append(rows, table.Row(row))
+
+		// fixes the data in case we have more columns than rows:
+		for len(data[row]) < len(columns) {
+			data[row] = append(data[row], "")
+		}
+
+		for i, col := range data[row] {
+			if len(o.Widths) == 0 {
+				width := lipgloss.Width(col)
+				if width > columns[i].Width {
+					columns[i].Width = width
+				}
+			}
+		}
+
+		rows = append(rows, table.Row(data[row]))
 	}
 
-	table := table.New(
+	if o.Print || !term.IsTerminal(os.Stdout.Fd()) {
+		table := ltable.New().
+			Headers(columnNames...).
+			Rows(data...).
+			BorderStyle(o.BorderStyle.ToLipgloss()).
+			Border(style.Border[o.Border]).
+			StyleFunc(func(row, _ int) lipgloss.Style {
+				if row == 0 {
+					return styles.Header
+				}
+				return styles.Cell
+			})
+
+		fmt.Println(table.Render())
+		return nil
+	}
+
+	opts := []table.Option{
 		table.WithColumns(columns),
 		table.WithFocused(true),
-		table.WithHeight(o.Height),
 		table.WithRows(rows),
 		table.WithStyles(styles),
-	)
+	}
+	if o.Height > 0 {
+		opts = append(opts, table.WithHeight(o.Height))
+	}
 
-	tm, err := tea.NewProgram(model{table: table}, tea.WithOutput(os.Stderr)).Run()
+	table := table.New(opts...)
 
+	ctx, cancel := timeout.Context(o.Timeout)
+	defer cancel()
+
+	m := model{
+		table:    table,
+		showHelp: o.ShowHelp,
+		help:     help.New(),
+		keymap:   defaultKeymap(),
+	}
+	tm, err := tea.NewProgram(
+		m,
+		tea.WithOutput(os.Stderr),
+		tea.WithContext(ctx),
+	).Run()
 	if err != nil {
 		return fmt.Errorf("failed to start tea program: %w", err)
 	}
@@ -103,19 +161,18 @@ func (o Options) Run() error {
 		return fmt.Errorf("failed to get selection")
 	}
 
-	m := tm.(model)
-
-	if err = writer.Write([]string(m.selected)); err != nil {
-		return fmt.Errorf("failed to write selected row: %w", err)
+	m = tm.(model)
+	if o.ReturnColumn > 0 && o.ReturnColumn <= len(m.selected) {
+		if err = writer.Write([]string{m.selected[o.ReturnColumn-1]}); err != nil {
+			return fmt.Errorf("failed to write col %d of selected row: %w", o.ReturnColumn, err)
+		}
+	} else {
+		if err = writer.Write([]string(m.selected)); err != nil {
+			return fmt.Errorf("failed to write selected row: %w", err)
+		}
 	}
 
 	writer.Flush()
 
-	return nil
-}
-
-// BeforeReset hook. Used to unclutter style flags.
-func (o Options) BeforeReset(ctx *kong.Context) error {
-	style.HideFlags(ctx)
 	return nil
 }

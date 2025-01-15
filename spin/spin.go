@@ -15,28 +15,45 @@
 package spin
 
 import (
+	"io"
+	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/term"
 )
 
 type model struct {
-	spinner spinner.Model
-	title   string
-	align   string
-	command []string
-	aborted bool
-
-	status int
-	stdout string
-	stderr string
+	spinner    spinner.Model
+	title      string
+	align      string
+	command    []string
+	quitting   bool
+	isTTY      bool
+	status     int
+	stdout     string
+	stderr     string
+	output     string
+	showStdout bool
+	showStderr bool
+	showError  bool
 }
+
+var (
+	bothbuf strings.Builder
+	outbuf  strings.Builder
+	errbuf  strings.Builder
+
+	executing *exec.Cmd
+)
 
 type finishCommandMsg struct {
 	stdout string
 	stderr string
+	output string
 	status int
 }
 
@@ -46,16 +63,18 @@ func commandStart(command []string) tea.Cmd {
 		if len(command) > 1 {
 			args = command[1:]
 		}
-		cmd := exec.Command(command[0], args...) //nolint:gosec
 
-		var outbuf, errbuf strings.Builder
-		cmd.Stdout = &outbuf
-		cmd.Stderr = &errbuf
-
-		_ = cmd.Run()
-
-		status := cmd.ProcessState.ExitCode()
-
+		executing = exec.Command(command[0], args...) //nolint:gosec
+		if term.IsTerminal(os.Stdout.Fd()) {
+			executing.Stdout = io.MultiWriter(&bothbuf, &outbuf)
+			executing.Stderr = io.MultiWriter(&bothbuf, &errbuf)
+		} else {
+			executing.Stdout = os.Stdout
+			executing.Stderr = os.Stderr
+		}
+		executing.Stdin = os.Stdin
+		_ = executing.Run()
+		status := executing.ProcessState.ExitCode()
 		if status == -1 {
 			status = 1
 		}
@@ -63,9 +82,17 @@ func commandStart(command []string) tea.Cmd {
 		return finishCommandMsg{
 			stdout: outbuf.String(),
 			stderr: errbuf.String(),
+			output: bothbuf.String(),
 			status: status,
 		}
 	}
+}
+
+func commandAbort() tea.Msg {
+	if executing != nil && executing.Process != nil {
+		_ = executing.Process.Signal(syscall.SIGINT)
+	}
+	return tea.InterruptMsg{}
 }
 
 func (m model) Init() tea.Cmd {
@@ -74,12 +101,31 @@ func (m model) Init() tea.Cmd {
 		commandStart(m.command),
 	)
 }
+
 func (m model) View() string {
-	if m.align == "left" {
-		return m.spinner.View() + " " + m.title
+	if !m.isTTY {
+		return m.title
 	}
 
-	return m.title + " " + m.spinner.View()
+	var out string
+	if m.showStderr {
+		out += errbuf.String()
+	}
+	if m.showStdout {
+		out += outbuf.String()
+	}
+
+	if m.quitting && out != "" {
+		return out
+	}
+
+	var header string
+	if m.align == "left" {
+		header = m.spinner.View() + " " + m.title
+	} else {
+		header = m.title + " " + m.spinner.View()
+	}
+	return header + "\n" + out
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -88,13 +134,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case finishCommandMsg:
 		m.stdout = msg.stdout
 		m.stderr = msg.stderr
+		m.output = msg.output
 		m.status = msg.status
+		m.quitting = true
 		return m, tea.Quit
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c":
-			m.aborted = true
-			return m, tea.Quit
+			return m, commandAbort
 		}
 	}
 

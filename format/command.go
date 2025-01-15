@@ -24,12 +24,12 @@ func (o Options) Run() error {
 	if len(o.Template) > 0 {
 		input = strings.Join(o.Template, "\n")
 	} else {
-		input, _ = stdin.Read()
+		input, _ = stdin.Read(stdin.StripANSI(o.StripANSI))
 	}
 
 	switch o.Type {
 	case "code":
-		output, err = code(input)
+		output, err = code(input, o.Language)
 	case "emoji":
 		output, err = emoji(input)
 	case "template":

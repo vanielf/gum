@@ -11,22 +11,78 @@
 package confirm
 
 import (
-	"fmt"
-	"time"
+	"github.com/charmbracelet/bubbles/help"
+	"github.com/charmbracelet/bubbles/key"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
+
+func defaultKeymap(affirmative, negative string) keymap {
+	return keymap{
+		Abort: key.NewBinding(
+			key.WithKeys("ctrl+c"),
+			key.WithHelp("ctrl+c", "cancel"),
+		),
+		Quit: key.NewBinding(
+			key.WithKeys("esc"),
+			key.WithHelp("esc", "quit"),
+		),
+		Negative: key.NewBinding(
+			key.WithKeys("n", "N", "q"),
+			key.WithHelp("n", negative),
+		),
+		Affirmative: key.NewBinding(
+			key.WithKeys("y", "Y"),
+			key.WithHelp("y", affirmative),
+		),
+		Toggle: key.NewBinding(
+			key.WithKeys(
+				"left",
+				"h",
+				"ctrl+n",
+				"shift+tab",
+				"right",
+				"l",
+				"ctrl+p",
+				"tab",
+			),
+			key.WithHelp("←→", "toggle"),
+		),
+		Submit: key.NewBinding(
+			key.WithKeys("enter"),
+			key.WithHelp("enter", "submit"),
+		),
+	}
+}
+
+type keymap struct {
+	Abort       key.Binding
+	Quit        key.Binding
+	Negative    key.Binding
+	Affirmative key.Binding
+	Toggle      key.Binding
+	Submit      key.Binding
+}
+
+// FullHelp implements help.KeyMap.
+func (k keymap) FullHelp() [][]key.Binding { return nil }
+
+// ShortHelp implements help.KeyMap.
+func (k keymap) ShortHelp() []key.Binding {
+	return []key.Binding{k.Toggle, k.Submit, k.Affirmative, k.Negative}
+}
 
 type model struct {
 	prompt      string
 	affirmative string
 	negative    string
 	quitting    bool
-	aborted     bool
-	hasTimeout  bool
-	timeout     time.Duration
+	showHelp    bool
+	help        help.Model
+	keys        keymap
 
+	showOutput   bool
 	confirmation bool
 
 	defaultSelection bool
@@ -37,62 +93,38 @@ type model struct {
 	unselectedStyle lipgloss.Style
 }
 
-const tickInterval = time.Second
-
-type tickMsg struct{}
-
-func tick() tea.Cmd {
-	return tea.Tick(tickInterval, func(time.Time) tea.Msg {
-		return tickMsg{}
-	})
-}
-
-func (m model) Init() tea.Cmd {
-	if m.timeout > 0 {
-		return tick()
-	}
-	return nil
-}
+func (m model) Init() tea.Cmd { return nil }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		return m, nil
 	case tea.KeyMsg:
-		switch msg.String() {
-		case "ctrl+c":
-			m.aborted = true
-			fallthrough
-		case "esc":
+		switch {
+		case key.Matches(msg, m.keys.Abort):
+			m.confirmation = false
+			return m, tea.Interrupt
+		case key.Matches(msg, m.keys.Quit):
 			m.confirmation = false
 			m.quitting = true
 			return m, tea.Quit
-		case "q", "n", "N":
+		case key.Matches(msg, m.keys.Negative):
 			m.confirmation = false
 			m.quitting = true
 			return m, tea.Quit
-		case "left", "h", "ctrl+p", "tab",
-			"right", "l", "ctrl+n", "shift+tab":
+		case key.Matches(msg, m.keys.Toggle):
 			if m.negative == "" {
 				break
 			}
 			m.confirmation = !m.confirmation
-		case "enter":
+		case key.Matches(msg, m.keys.Submit):
 			m.quitting = true
 			return m, tea.Quit
-		case "y", "Y":
+		case key.Matches(msg, m.keys.Affirmative):
 			m.quitting = true
 			m.confirmation = true
 			return m, tea.Quit
 		}
-	case tickMsg:
-		if m.timeout <= 0 {
-			m.quitting = true
-			m.confirmation = m.defaultSelection
-			return m, tea.Quit
-		}
-		m.timeout -= tickInterval
-		return m, tick()
 	}
 	return m, nil
 }
@@ -102,27 +134,14 @@ func (m model) View() string {
 		return ""
 	}
 
-	var aff, neg, timeout, affirmativeTimeout, negativeTimeout string
-
-	if m.hasTimeout {
-		timeout = fmt.Sprintf(" (%d)", max(0, int(m.timeout.Seconds())))
-	}
-
-	// set timer based on defaultSelection
-	if m.defaultSelection {
-		affirmativeTimeout = m.affirmative + timeout
-		negativeTimeout = m.negative
-	} else {
-		affirmativeTimeout = m.affirmative
-		negativeTimeout = m.negative + timeout
-	}
+	var aff, neg string
 
 	if m.confirmation {
-		aff = m.selectedStyle.Render(affirmativeTimeout)
-		neg = m.unselectedStyle.Render(negativeTimeout)
+		aff = m.selectedStyle.Render(m.affirmative)
+		neg = m.unselectedStyle.Render(m.negative)
 	} else {
-		aff = m.unselectedStyle.Render(affirmativeTimeout)
-		neg = m.selectedStyle.Render(negativeTimeout)
+		aff = m.unselectedStyle.Render(m.affirmative)
+		neg = m.selectedStyle.Render(m.negative)
 	}
 
 	// If the option is intentionally empty, do not show it.
@@ -130,12 +149,18 @@ func (m model) View() string {
 		neg = ""
 	}
 
-	return lipgloss.JoinVertical(lipgloss.Center, m.promptStyle.Render(m.prompt), lipgloss.JoinHorizontal(lipgloss.Left, aff, neg))
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
+	if m.showHelp {
+		return lipgloss.JoinVertical(
+			lipgloss.Left,
+			m.promptStyle.Render(m.prompt)+"\n",
+			lipgloss.JoinHorizontal(lipgloss.Left, aff, neg),
+			"\n"+m.help.View(m.keys),
+		)
 	}
-	return b
+
+	return lipgloss.JoinVertical(
+		lipgloss.Left,
+		m.promptStyle.Render(m.prompt)+"\n",
+		lipgloss.JoinHorizontal(lipgloss.Left, aff, neg),
+	)
 }

@@ -1,24 +1,25 @@
 package write
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"strings"
 
-	"github.com/alecthomas/kong"
+	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
-
-	"github.com/charmbracelet/gum/internal/exit"
+	"github.com/charmbracelet/gum/cursor"
 	"github.com/charmbracelet/gum/internal/stdin"
-	"github.com/charmbracelet/gum/style"
+	"github.com/charmbracelet/gum/internal/timeout"
 )
 
 // Run provides a shell script interface for the text area bubble.
 // https://github.com/charmbracelet/bubbles/textarea
 func (o Options) Run() error {
-	in, _ := stdin.Read()
+	in, _ := stdin.Read(stdin.StripANSI(o.StripANSI))
 	if in != "" && o.Value == "" {
-		o.Value = in
+		o.Value = strings.ReplaceAll(in, "\r", "")
 	}
 
 	a := textarea.New()
@@ -28,6 +29,7 @@ func (o Options) Run() error {
 	a.Placeholder = o.Placeholder
 	a.ShowLineNumbers = o.ShowLineNumbers
 	a.CharLimit = o.CharLimit
+	a.MaxHeight = o.MaxLines
 
 	style := textarea.Style{
 		Base:             o.BaseStyle.ToLipgloss(),
@@ -42,31 +44,39 @@ func (o Options) Run() error {
 	a.BlurredStyle = style
 	a.FocusedStyle = style
 	a.Cursor.Style = o.CursorStyle.ToLipgloss()
+	a.Cursor.SetMode(cursor.Modes[o.CursorMode])
 
 	a.SetWidth(o.Width)
 	a.SetHeight(o.Height)
 	a.SetValue(o.Value)
 
-	p := tea.NewProgram(model{
+	m := model{
 		textarea:    a,
 		header:      o.Header,
 		headerStyle: o.HeaderStyle.ToLipgloss(),
-	}, tea.WithOutput(os.Stderr))
+		autoWidth:   o.Width < 1,
+		help:        help.New(),
+		showHelp:    o.ShowHelp,
+		keymap:      defaultKeymap(),
+	}
+
+	ctx, cancel := timeout.Context(o.Timeout)
+	defer cancel()
+
+	p := tea.NewProgram(
+		m,
+		tea.WithOutput(os.Stderr),
+		tea.WithReportFocus(),
+		tea.WithContext(ctx),
+	)
 	tm, err := p.Run()
 	if err != nil {
 		return fmt.Errorf("failed to run write: %w", err)
 	}
-	m := tm.(model)
-	if m.aborted {
-		return exit.ErrAborted
+	m = tm.(model)
+	if !m.submitted {
+		return errors.New("not submitted")
 	}
-
 	fmt.Println(m.textarea.Value())
-	return nil
-}
-
-// BeforeReset hook. Used to unclutter style flags.
-func (o Options) BeforeReset(ctx *kong.Context) error {
-	style.HideFlags(ctx)
 	return nil
 }

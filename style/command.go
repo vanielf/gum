@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/alecthomas/kong"
 	"github.com/charmbracelet/gum/internal/stdin"
 )
 
@@ -21,28 +20,18 @@ func (o Options) Run() error {
 	if len(o.Text) > 0 {
 		text = strings.Join(o.Text, "\n")
 	} else {
-		text, _ = stdin.Read()
+		text, _ = stdin.Read(stdin.StripANSI(o.StripANSI))
 		if text == "" {
 			return errors.New("no input provided, see `gum style --help`")
 		}
-		text = strings.TrimSuffix(text, "\n")
+	}
+	if o.Trim {
+		var lines []string
+		for _, line := range strings.Split(text, "\n") {
+			lines = append(lines, strings.TrimSpace(line))
+		}
+		text = strings.Join(lines, "\n")
 	}
 	fmt.Println(o.Style.ToLipgloss().Render(text))
 	return nil
-}
-
-// HideFlags hides the flags from the usage output. This is used in conjunction
-// with BeforeReset hook.
-func HideFlags(ctx *kong.Context) {
-	n := ctx.Selected()
-	if n == nil {
-		return
-	}
-	for _, f := range n.Flags {
-		if g := f.Group; g != nil && g.Key == groupName {
-			if !strings.HasSuffix(f.Name, ".foreground") {
-				f.Hidden = true
-			}
-		}
-	}
 }

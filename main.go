@@ -7,10 +7,10 @@ import (
 	"runtime/debug"
 
 	"github.com/alecthomas/kong"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/gum/internal/exit"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/termenv"
-
-	"github.com/charmbracelet/gum/internal/exit"
 )
 
 const shaLen = 7
@@ -28,7 +28,7 @@ var (
 var bubbleGumPink = lipgloss.NewStyle().Foreground(lipgloss.Color("212"))
 
 func main() {
-	lipgloss.SetColorProfile(termenv.ANSI256)
+	lipgloss.SetColorProfile(termenv.NewOutput(os.Stderr).Profile)
 
 	if Version == "" {
 		if info, ok := debug.ReadBuildInfo(); ok && info.Main.Sum != "" {
@@ -48,11 +48,13 @@ func main() {
 		kong.Description(fmt.Sprintf("A tool for %s shell scripts.", bubbleGumPink.Render("glamorous"))),
 		kong.UsageOnError(),
 		kong.ConfigureHelp(kong.HelpOptions{
-			Compact: true,
-			Summary: false,
+			Compact:             true,
+			Summary:             false,
+			NoExpandSubcommands: true,
 		}),
 		kong.Vars{
 			"version":                 version,
+			"versionNumber":           Version,
 			"defaultHeight":           "0",
 			"defaultWidth":            "0",
 			"defaultAlign":            "left",
@@ -71,10 +73,18 @@ func main() {
 		},
 	)
 	if err := ctx.Run(); err != nil {
-		if errors.Is(err, exit.ErrAborted) {
+		var ex exit.ErrExit
+		if errors.As(err, &ex) {
+			os.Exit(int(ex))
+		}
+		if errors.Is(err, tea.ErrProgramKilled) {
+			fmt.Fprintln(os.Stderr, "timed out")
+			os.Exit(exit.StatusTimeout)
+		}
+		if errors.Is(err, tea.ErrInterrupted) {
 			os.Exit(exit.StatusAborted)
 		}
-		fmt.Println(err)
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
